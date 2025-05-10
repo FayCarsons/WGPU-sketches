@@ -4,7 +4,12 @@ interface Vec2 {
   readonly x: number;
   readonly y: number;
 };
-type ResourceBuilder = {
+
+function vec2(x: number, y: number): Vec2 {
+  return {x, y}
+}
+
+interface ResourceBuilder {
   adapter: GPUAdapter | null;
   device: GPUDevice | null;
   context: GPUCanvasContext | null;
@@ -40,13 +45,13 @@ function buildResources(builder: ResourceBuilder): GPUResources | Error {
 }
 
 type AppState = {
-  readonly canvas: HTMLCanvasElement;
-  readonly video: HTMLVideoElement;
-  readonly resources: GPUResources;
-  readonly canvasSize: Vec2;
-  readonly time: number;
-  readonly threshold: number;
-};
+  canvas: HTMLCanvasElement;
+  video: HTMLVideoElement;
+  resources: GPUResources;
+  canvasSize: Vec2;
+  time: number;
+  threshold: number;
+}
 
 type WebGPUConfig = {
   readonly powerPreference: GPUPowerPreference;
@@ -81,6 +86,25 @@ function fail(e: Error) {
         Please check your camera permissions.
       </div>
     `;
+}
+
+function debounce<T extends (...args: any[]) => any>(f: T, interval: number): (...args: Parameters<T>) => void {
+  let timeout: number | null = null
+
+  return function(this: any, ...args: Parameters<T>): void {
+    const context = this;
+
+    const later = function() {
+      timeout = null;
+      f.apply(context, args)
+    }
+
+    if (timeout !== null) {
+      clearTimeout(timeout)
+    }
+
+    timeout = window.setTimeout(later, interval)
+  }
 }
 
 function checkWebGPUSupport(): void {
@@ -303,11 +327,6 @@ class PingPongBuffer {
   }
 }
 
-// Create bind group layout with just what we need:
-// - sampler
-// - current frame texture
-// - previous frame texture
-// - uniform buffer
 function createBindGroupLayout(device: GPUDevice, videoBuffer: PingPongBuffer, differenceBuffer: PingPongBuffer): GPUBindGroupLayout {
   return device.createBindGroupLayout({
     entries: [
@@ -407,7 +426,7 @@ async function setupWebcam(video: HTMLVideoElement): Promise<HTMLVideoElement | 
 };
 
 
-function onResize(state: AppState): AppState {
+function onResize(state: AppState) {
   log('Resizing!')
   const newSize: Vec2 = {
     x: window.innerWidth,
@@ -417,15 +436,36 @@ function onResize(state: AppState): AppState {
   state.canvas.width = newSize.x;
   state.canvas.height = newSize.y;
 
-  return {
-    ...state,
-    canvasSize: newSize
-  };
-};
+  state.resources.device.queue.writeBuffer(
+    state.resources.uniformBuffer,
+    0,
+    new Float32Array([
+      newSize.x,
+      newSize.y,
+      state.threshold,
+      state.time
+    ])
+  )
+
+  const device = state.resources.device 
+
+  const newDifferenceBuffer = new PingPongBuffer(device, newSize, 'r8unorm')
+  const newVideoBuffer = new PingPongBuffer(device, vec2(state.video.videoWidth, state.video.videoHeight))
+
+  const resources = {
+    ...state.resources,
+    videoBuffer: newVideoBuffer,
+    differenceBuffer: newDifferenceBuffer
+  }
+  const bindGroup = createBindGroup(resources)
+  resources.bindGroup = bindGroup
+  state.resources = resources
+  state.canvasSize = newSize
+}
 
 function render(
   state: AppState,
-): AppState {
+) {
   const newTime = state.time + DELTA
 
   // Create command encoder
@@ -473,20 +513,19 @@ function render(
   state.resources.differenceBuffer.swap();
 
   // After rendering, create a new bind group that swaps the textures
-  const newBindGroup = createBindGroup(
-    state.resources
-  );
+  const renderBindGroup = state.resources.device.createBindGroup({
+    layout: state.resources.pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: state.resources.sampler },
+      { binding: 1, resource: { buffer: state.resources.uniformBuffer } },
+      { binding: 2, resource: state.resources.videoBuffer.frontView() },
+      { binding: 3, resource: state.resources.videoBuffer.backView() },
+      { binding: 4, resource: state.resources.differenceBuffer.backView() } // ONLY read from back
+    ]
+  })
 
-  // Return state with updated bind group and currentFrameIndex
-  return {
-    ...state,
-    resources: {
-      ...state.resources,
-      bindGroup: newBindGroup
-    },
-    time: newTime
-  };
-};
+  state.resources.bindGroup = renderBindGroup
+}
 
 // Main initialization function
 async function init(): Promise<void> {
@@ -540,18 +579,15 @@ async function init(): Promise<void> {
   );
 
   const builder: ResourceBuilder = {
-      adapter,
-      device,
-      context,
-      pipeline,
-      videoBuffer, 
-      differenceBuffer,
-      sampler,
-      uniformBuffer,
-    }
-
-  const bindGroup = createBindGroup(builder);
-
+    adapter,
+    device,
+    context,
+    pipeline,
+    videoBuffer, 
+    differenceBuffer,
+    sampler,
+    uniformBuffer,
+  }
   let resources = buildResources(builder) as GPUResources
 
   let globalState: AppState = {
@@ -563,8 +599,8 @@ async function init(): Promise<void> {
     time: 0,
   };
 
-  const writeState = (f: (state: AppState) => AppState) => {
-    globalState = f(globalState)
+  const writeState = (f: (state: AppState) => void) => {
+    f(globalState)
   }
 
   // Window resize handler, now updates the global state
